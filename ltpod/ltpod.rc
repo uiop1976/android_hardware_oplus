@@ -1,0 +1,8 @@
+service vendor.ltpod /vendor/bin/ltpod
+    class late_start
+    # min_fps / ultra_low_power_aod_mode are root:root 0644 in this kernel,
+    # and the display driver re-registers the sysfs group on first display
+    # init, which can wipe permissions set earlier from init.rc. Running as
+    # root keeps the daemon independent of that race.
+    user root
+    group root system

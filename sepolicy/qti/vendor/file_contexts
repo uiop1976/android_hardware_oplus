@@ -237,6 +237,9 @@
 /vendor/bin/hw/android\.hardware\.vibrator\.service\.oplus-richtap    u:object_r:hal_vibrator_default_exec:s0
 /vendor/bin/hw/vendor\.qti\.hardware\.vibrator\.service\.oplus        u:object_r:hal_vibrator_default_exec:s0
 
+# LTPO / AOD refresh rate daemon
+/vendor/bin/ltpod    u:object_r:vendor_ltpod_exec:s0
+
 # Widevine
 /vendor/bin/wvmkiller    u:object_r:vendor_wvmkiller_exec:s0
 
