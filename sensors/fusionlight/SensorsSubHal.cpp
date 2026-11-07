@@ -368,6 +368,13 @@ void SensorsSubHal::emitFusionEvent(Event event) {
     if (!fusion_light_enabled_.load() || hal_proxy_callback_ == nullptr) {
         return;
     }
+    if (std::isfinite(event.u.scalar) && event.u.scalar >= 0.0f) {
+        FILE* fp = fopen("/data/vendor/display/aod_als_lux", "we");
+        if (fp != nullptr) {
+            fprintf(fp, "%d\n", static_cast<int>(event.u.scalar + 0.5f));
+            fclose(fp);
+        }
+    }
     std::vector<Event> events;
     events.push_back(std::move(event));
     hal_proxy_callback_->postEvents(events, hal_proxy_callback_->createScopedWakelock(false));

@@ -3,5 +3,6 @@ type vendor_ltpod_exec, exec_type, vendor_file_type, file_type;
 
 init_daemon_domain(vendor_ltpod)
 
-# LTPO / AOD sysfs: adfr_config, dsi_cmd, min_fps, power_status
+# LTPO / AOD sysfs: adfr_config, dsi_cmd, min_fps, power_status, aod_light_mode_set
 rw_dir_file(vendor_ltpod, vendor_sysfs_graphics)
+r_dir_file(vendor_ltpod, vendor_display_vendor_data_file)
