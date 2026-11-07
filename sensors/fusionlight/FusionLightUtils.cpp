@@ -34,6 +34,8 @@ constexpr int32_t kPanelInfoFeature = 9;
 constexpr int32_t kMainPanelStageFeature = 0x22;
 constexpr int32_t kDefaultPanelStage = 4;
 constexpr auto kCwbWeightsPath = "/odm/etc/display/cwb_weightspos.json";
+constexpr auto kWiseRgbCompScalePath =
+        "/mnt/vendor/persist/sensors/registry/registry/wise_rgb_comp_scale";
 constexpr auto kDefaultScreenshotPeriod = 250ms;
 
 bool ReadNumber(const Json::Value& value, double& result) {
@@ -680,10 +682,11 @@ struct MainPanelConfig {
 };
 
 std::optional<MainPanelConfig> GetMainPanelConfig() {
+    constexpr MainPanelConfig kFallbackPanelConfig{1, kDefaultPanelStage};
     const auto service = GetService<IDisplayPanelFeature>();
     if (service == nullptr) {
-        LOG(ERROR) << "IDisplayPanelFeature is unavailable";
-        return std::nullopt;
+        LOG(WARNING) << "IDisplayPanelFeature is unavailable; using fallback BOE panel config";
+        return kFallbackPanelConfig;
     }
 
     std::vector<std::string> panel_info;
@@ -691,21 +694,22 @@ std::optional<MainPanelConfig> GetMainPanelConfig() {
     const auto info_status =
             service->getDisplayPanelInfo(kPanelInfoFeature, &panel_info, &return_value);
     if (!info_status.isOk()) {
-        LOG(ERROR) << "IDisplayPanelFeature::getDisplayPanelInfo failed: "
-                   << info_status.getDescription();
-        return std::nullopt;
+        LOG(WARNING) << "IDisplayPanelFeature::getDisplayPanelInfo failed: "
+                     << info_status.getDescription() << "; using fallback BOE panel config";
+        return kFallbackPanelConfig;
     }
     LOG(INFO) << "IDisplayPanelFeature::getDisplayPanelInfo returned " << return_value << " with "
               << panel_info.size() << " values: [" << android::base::Join(panel_info, ", ") << "]";
     if (return_value != 0 || panel_info.size() < 2) {
-        LOG(ERROR) << "Invalid main display panel information";
-        return std::nullopt;
+        LOG(WARNING) << "Invalid main display panel information; using fallback BOE panel config";
+        return kFallbackPanelConfig;
     }
 
     const int32_t panel_id = GetPanelId(panel_info[1]);
     if (panel_id < 0) {
-        LOG(ERROR) << "Unknown main display panel " << panel_info[1];
-        return std::nullopt;
+        LOG(WARNING) << "Unknown main display panel " << panel_info[1]
+                     << "; using fallback BOE panel config";
+        return kFallbackPanelConfig;
     }
     LOG(INFO) << "Resolved main display panel " << panel_info[1] << " to ID " << panel_id;
 
@@ -768,6 +772,52 @@ const Json::Value* FindMember(const Json::Value& value, const std::string& name)
         }
     }
     return nullptr;
+}
+
+bool LoadPersistViewLeakage(std::vector<ViewCalibration>& leakage) {
+    std::ifstream stream(kWiseRgbCompScalePath);
+    if (!stream.is_open()) {
+        return false;
+    }
+    Json::CharReaderBuilder builder;
+    builder["collectComments"] = false;
+    Json::Value root;
+    std::string error;
+    if (!Json::parseFromStream(builder, stream, &root, &error)) {
+        LOG(WARNING) << "Invalid wise_rgb_comp_scale calibration: " << error;
+        return false;
+    }
+    const Json::Value& scale = root["wise_rgb_comp_scale"];
+    if (!scale.isObject()) {
+        return false;
+    }
+
+    constexpr const char* kCompSegments[] = {"comp0", "comp2", "comp1"};
+    constexpr const char* kCompViews[] = {"R_comp", "G_comp", "B_comp", "C_comp"};
+    constexpr const char* kCompChannels[] = {"r", "g", "b", "c"};
+    if (leakage.size() > std::size(kCompSegments)) {
+        return false;
+    }
+    for (size_t segment = 0; segment < leakage.size(); ++segment) {
+        const Json::Value& comp = scale[kCompSegments[segment]];
+        if (!comp.isObject()) {
+            return false;
+        }
+        for (int view = 0; view < kChannelCount; ++view) {
+            const Json::Value& view_obj = comp[kCompViews[view]];
+            if (!view_obj.isObject()) {
+                return false;
+            }
+            for (int channel = 0; channel < kChannelCount; ++channel) {
+                if (!ReadNumber(view_obj[kCompChannels[channel]],
+                                leakage[segment](view, channel))) {
+                    return false;
+                }
+            }
+        }
+    }
+    LOG(INFO) << "Loaded FusionLight view calibration from " << kWiseRgbCompScalePath;
+    return true;
 }
 
 }  // namespace
@@ -860,54 +910,55 @@ std::vector<Channels> LoadCalibration(const FusionConfig& config) {
 
 std::vector<ViewCalibration> LoadViewCalibration(const FusionConfig& config) {
     std::vector<ViewCalibration> calibration(config.segments.size(), ViewCalibration::Ones());
-    const auto service = GetService<ISensorFeature>();
-    if (service == nullptr) {
-        LOG(WARNING) << "ISensorFeature is unavailable; using unit FusionLight calibration";
-        return calibration;
-    }
-
-    std::string response;
-    const auto status = service->getSensorCalibrationData(kHighPwmSensorType, &response);
-    if (!status.isOk()) {
-        LOG(WARNING) << "ISensorFeature::getSensorCalibrationData failed: "
-                     << status.getDescription() << "; using unit FusionLight calibration";
-        return calibration;
-    }
-    LOG(INFO) << "ISensorFeature::getSensorCalibrationData returned " << response.size()
-              << " bytes: " << response;
-    if (response.empty() || response == "default") {
-        LOG(WARNING) << "No device FusionLight calibration; using unit calibration";
-        return calibration;
-    }
-
-    Json::CharReaderBuilder builder;
-    builder["collectComments"] = false;
-    std::istringstream stream(response);
-    Json::Value root;
-    std::string error;
-    if (!Json::parseFromStream(builder, stream, &root, &error)) {
-        LOG(WARNING) << "Invalid device FusionLight calibration: " << error;
-        return calibration;
-    }
-
-    // Measured leakage is indexed by screen view, then by sensor channel.
-    constexpr const char* kNames[] = {"R", "G", "B", "C"};
-    constexpr const char* kViews[] = {"R", "G", "B", "W"};
-    constexpr const char* kSuffixes[] = {"", "_M", "_L"};
     std::vector<ViewCalibration> leakage(config.segments.size());
-    for (int segment = 0; segment < leakage.size(); ++segment) {
-        for (int view = 0; view < kChannelCount; ++view) {
-            for (int channel = 0; channel < kChannelCount; ++channel) {
-                const std::string key = std::string(kViews[view]) + "_VIEW_" + kNames[channel] +
-                                        "_MAX" + kSuffixes[segment];
-                const Json::Value* value = FindMember(root, key);
-                if (value == nullptr || !ReadNumber(*value, leakage[segment](view, channel))) {
-                    LOG(WARNING) << "Missing device FusionLight calibration value " << key
-                                 << "; using unit calibration";
-                    return calibration;
+    bool has_leakage = false;
+
+    const auto service = GetService<ISensorFeature>();
+    if (service != nullptr) {
+        std::string response;
+        const auto status = service->getSensorCalibrationData(kHighPwmSensorType, &response);
+        if (!status.isOk()) {
+            LOG(WARNING) << "ISensorFeature::getSensorCalibrationData failed: "
+                         << status.getDescription();
+        } else if (!response.empty() && response != "default") {
+            LOG(INFO) << "ISensorFeature::getSensorCalibrationData returned " << response.size()
+                      << " bytes: " << response;
+            Json::CharReaderBuilder builder;
+            builder["collectComments"] = false;
+            std::istringstream stream(response);
+            Json::Value root;
+            std::string error;
+            if (!Json::parseFromStream(builder, stream, &root, &error)) {
+                LOG(WARNING) << "Invalid device FusionLight calibration: " << error;
+            } else {
+                // Measured leakage is indexed by screen view, then by sensor channel.
+                constexpr const char* kNames[] = {"R", "G", "B", "C"};
+                constexpr const char* kViews[] = {"R", "G", "B", "W"};
+                constexpr const char* kSuffixes[] = {"", "_M", "_L"};
+                has_leakage = true;
+                for (int segment = 0; segment < leakage.size() && has_leakage; ++segment) {
+                    for (int view = 0; view < kChannelCount && has_leakage; ++view) {
+                        for (int channel = 0; channel < kChannelCount; ++channel) {
+                            const std::string key = std::string(kViews[view]) + "_VIEW_" +
+                                                    kNames[channel] + "_MAX" + kSuffixes[segment];
+                            const Json::Value* value = FindMember(root, key);
+                            if (value == nullptr ||
+                                !ReadNumber(*value, leakage[segment](view, channel))) {
+                                LOG(WARNING)
+                                        << "Missing device FusionLight calibration value " << key;
+                                has_leakage = false;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if (!has_leakage && !LoadPersistViewLeakage(leakage)) {
+        LOG(WARNING) << "Device FusionLight calibration is unavailable; using unit calibration";
+        return calibration;
     }
 
     for (int segment = 0; segment < calibration.size(); ++segment) {
