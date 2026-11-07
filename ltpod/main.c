@@ -58,6 +58,8 @@
 #define PATH_ADFR_CONFIG DISPLAY_DIR "/adfr_config"
 #define PATH_MIN_FPS DISPLAY_DIR "/min_fps"
 #define PATH_DSI_CMD DISPLAY_DIR "/dsi_cmd"
+#define PATH_AOD_LIGHT_MODE DISPLAY_DIR "/aod_light_mode_set"
+#define PATH_AOD_ALS_LUX "/data/vendor/display/aod_als_lux"
 
 #define CMD_ULP_ON "qcom,mdss-dsi-ultra-low-power-aod-on-command"
 #define CMD_ULP_OFF "qcom,mdss-dsi-ultra-low-power-aod-off-command"
@@ -66,6 +68,11 @@
 #define AOD_SETTLE_MS 10000
 #define POST_ON_VERIFY_MS 1000
 #define DEFAULT_MIN_FPS 120
+
+#define AOD_GEAR_SWITCH_LUX 30
+#define AOD_GEAR_UP_LUX 35
+#define AOD_GEAR_DOWN_LUX 22
+#define AOD_GEAR_CONFIRM_TICKS 6
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -159,13 +166,75 @@ static void send_panel_command(const char* command) {
     write_line(PATH_DSI_CMD, "send");
 }
 
+static int read_aod_lux(int fallback_lux) {
+    char buf[32];
+    if (!read_trim(PATH_AOD_ALS_LUX, buf, sizeof(buf)) || buf[0] == '\0') {
+        return fallback_lux;
+    }
+    int val = fallback_lux;
+    if (sscanf(buf, "%d", &val) == 1 && val >= 0) {
+        return val;
+    }
+    return fallback_lux;
+}
+
+/* Sets hardware AOD base brightness gear via /sys/kernel/oplus_display/aod_light_mode_set:
+ *   gear = 1 -> aod-low-mode-command  (DBV 0x0A81 = 2689, ~10 nits)
+ *   gear = 0 -> aod-high-mode-command (DBV 0x0D04 = 3332, ~50 nits)
+ * Upon entering LP1, dsi_panel_set_lp1 resets ofp_ctx->aod_light_mode = 0 while lp1-command
+ * programs the physical panel to 0x0A81 (gear 1). Writing "1" first on AOD entry synchronizes
+ * ofp_ctx->aod_light_mode so a subsequent write of "0" triggers aod-high-mode-command. */
+static void set_aod_hardware_gear(int gear, int is_entry) {
+    if (is_entry) {
+        write_line(PATH_AOD_LIGHT_MODE, "1");
+    }
+    write_line(PATH_AOD_LIGHT_MODE, gear == 0 ? "0" : "1");
+}
+
+static void update_aod_hardware_gear(int* cur_gear, int* cand_gear, int* gear_cnt) {
+    int lux = read_aod_lux(50);
+    if (*cur_gear < 0) {
+        *cur_gear = (lux >= AOD_GEAR_SWITCH_LUX) ? 0 : 1;
+        set_aod_hardware_gear(*cur_gear, 1);
+        *cand_gear = *cur_gear;
+        *gear_cnt = 0;
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                            "aod enter -> lux=%d hardware_gear=%d", lux, *cur_gear);
+        return;
+    }
+
+    int target_gear = *cur_gear;
+    if (*cur_gear == 1 && lux >= AOD_GEAR_UP_LUX) {
+        target_gear = 0;
+    } else if (*cur_gear == 0 && lux <= AOD_GEAR_DOWN_LUX) {
+        target_gear = 1;
+    }
+
+    if (target_gear == *cand_gear) {
+        (*gear_cnt)++;
+    } else {
+        *cand_gear = target_gear;
+        *gear_cnt = 1;
+    }
+
+    if (*cand_gear != *cur_gear && *gear_cnt >= AOD_GEAR_CONFIRM_TICKS) {
+        *cur_gear = *cand_gear;
+        set_aod_hardware_gear(*cur_gear, 0);
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                            "aod gear switch -> lux=%d hardware_gear=%d", lux, *cur_gear);
+    }
+}
+
 /* Waits for the AOD entry sequence to settle. Returns 0 if AOD was left or the
  * daemon is shutting down. */
-static int wait_aod_settle(void) {
+static int wait_aod_settle(int* cur_gear, int* cand_gear, int* gear_cnt) {
     for (int waited = 0; waited < AOD_SETTLE_MS; waited += POLL_MS) {
         sleep_ms(POLL_MS);
         if (g_stop) return 0;
         if (!in_aod()) return 0;
+        if (waited >= POLL_MS) {
+            update_aod_hardware_gear(cur_gear, cand_gear, gear_cnt);
+        }
     }
     return 1;
 }
@@ -176,6 +245,9 @@ int main(void) {
 
     int ulp_on = 0;
     int was_enabled = 0;
+    int cur_gear = -1;
+    int cand_gear = -1;
+    int gear_cnt = 0;
 
     /* A previous boot or a crashed instance may have left the DDIC in ULP. */
     send_panel_command(CMD_ULP_OFF);
@@ -184,6 +256,14 @@ int main(void) {
     while (!g_stop) {
         int aod = in_aod();
         int enabled = ltpo_enabled();
+
+        if (aod) {
+            update_aod_hardware_gear(&cur_gear, &cand_gear, &gear_cnt);
+        } else {
+            cur_gear = -1;
+            cand_gear = -1;
+            gear_cnt = 0;
+        }
 
         if (!enabled) {
             if (was_enabled) {
@@ -218,7 +298,7 @@ int main(void) {
         }
 
         if (aod) {
-            if (!ulp_on && wait_aod_settle()) {
+            if (!ulp_on && wait_aod_settle(&cur_gear, &cand_gear, &gear_cnt)) {
                 send_panel_command(CMD_ULP_ON);
                 ulp_on = 1;
                 __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "aod enter -> ULP on (1Hz)");
