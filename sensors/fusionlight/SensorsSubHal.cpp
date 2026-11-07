@@ -93,14 +93,23 @@ Return<Result> SensorsSubHal::activate(int32_t sensor_handle, bool enabled) {
             return Result::OK;
         }
 
-        const bool was_physically_enabled = raw_enabled_ || fusion_light_enabled;
-        const bool should_be_physically_enabled =
-                fusion_light_request ? raw_enabled_ || enabled : enabled || fusion_light_enabled;
-        if (was_physically_enabled != should_be_physically_enabled) {
-            auto result = impl_->activate(physical_handle, should_be_physically_enabled);
+        // Once the underlying Non-wakeup high-PWM RGB sensor (sip3625_lron Oplus High_pwm Light)
+        // is activated, keep it active in sensors.qsh.so so ADSP alsps_sip3625_lron never loses
+        // real-time OLED brightness/AOD crosstalk compensation (wise_rgb MSG_ID 0x710) and its
+        // 3-second QMI watchdog timestamp (+0x560) stays fresh across Screen ON / AOD / Call states.
+        // Because high_pwm_handle_ is Non-wakeup, ADSP automatically suspends AP delivery during
+        // deep sleep with zero battery overhead.
+        if (enabled && !physical_high_pwm_active_) {
+            if (raw_light_handle_ >= 0 && !raw_light_activated_) {
+                impl_->activate(raw_light_handle_, true);
+                impl_->batch(raw_light_handle_, 200000000LL, 0);
+                raw_light_activated_ = true;
+            }
+            auto result = impl_->activate(physical_handle, true);
             if (result != Result::OK) {
                 return result;
             }
+            physical_high_pwm_active_ = true;
         }
 
         if (fusion_light_request) {
@@ -108,6 +117,26 @@ Return<Result> SensorsSubHal::activate(int32_t sensor_handle, bool enabled) {
             fusion_light_.setEnabled(enabled);
         } else {
             raw_enabled_ = enabled;
+        }
+
+        auto** p_iface = reinterpret_cast<void**>(
+                dlsym(lib_handle_.get(), "_ZN17oplus_light_iface8_p_ifaceE"));
+        auto config_connection = reinterpret_cast<bool (*)(void*, uint8_t, bool)>(
+                dlsym(lib_handle_.get(), "_ZN17oplus_light_iface17config_connectionEhb"));
+        auto send_brightness = reinterpret_cast<void (*)(void*)>(
+                dlsym(lib_handle_.get(), "_ZN17oplus_light_iface15send_brightnessEv"));
+        if (p_iface != nullptr && *p_iface != nullptr && config_connection != nullptr) {
+            auto base = reinterpret_cast<uintptr_t>(*p_iface);
+            *reinterpret_cast<uint8_t*>(base + 0x4e0) = 0;
+            config_connection(*p_iface, 1, true);
+            if (send_brightness != nullptr) {
+                send_brightness(*p_iface);
+            }
+            LOG(INFO) << "oplus_light_iface state: als_type=" << *reinterpret_cast<uint32_t*>(base + 0x1c)
+                      << " conn_mask=" << static_cast<int>(*reinterpret_cast<uint8_t*>(base + 0x35))
+                      << " br=" << *reinterpret_cast<uint32_t*>(base + 0x14c)
+                      << " blank_mode=" << *reinterpret_cast<uint16_t*>(base + 0x448)
+                      << " use_black_mode=" << static_cast<int>(*reinterpret_cast<uint8_t*>(base + 0x4e0));
         }
     }
     return Result::OK;
@@ -192,7 +221,16 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb c
         sensors[source.size()].sensorHandle = fusion_light_handle;
         sensors[source.size()].name = "Oplus FusionLight Sensor";
         sensors[source.size()].type = SensorType::LIGHT;
-        sensors[source.size()].typeAsString = "";
+        sensors[source.size()].typeAsString = SENSOR_STRING_TYPE_LIGHT;
+
+        const auto raw_light = std::find_if(sensors.begin(), sensors.begin() + source.size(),
+                                            [](const auto& sensor) {
+                                                return sensor.type == SensorType::LIGHT;
+                                            });
+        if (raw_light != sensors.begin() + source.size()) {
+            raw_light_handle_ = raw_light->sensorHandle;
+            std::swap(*raw_light, sensors[source.size()]);
+        }
 
         bool initialize_fusion_light = false;
         if (high_pwm_handle_ < 0 && fusion_light_handle_ < 0) {
@@ -212,6 +250,27 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb c
             const auto profile_sensor =
                     main_profile_sensor == source.end() ? high_pwm : main_profile_sensor;
             fusion_light_.initialize(profile_sensor->name.c_str());
+
+            // Keep oplus_light_iface's QMI brightness/blank_mode connection (MSG_ID 0x710)
+            // permanently active on client slot 1 so ADSP's under-display proximity/ALS
+            // sensor (alsps_sip3625_lron) always receives real-time brightness, DC dimming,
+            // and panel power state (ON / AOD / OFF) updates even when auto-brightness is
+            // disabled during phone calls or deactivated upon entering AOD.
+            auto** p_iface = reinterpret_cast<void**>(
+                    dlsym(lib_handle_.get(), "_ZN17oplus_light_iface8_p_ifaceE"));
+            auto config_connection = reinterpret_cast<bool (*)(void*, uint8_t, bool)>(
+                    dlsym(lib_handle_.get(), "_ZN17oplus_light_iface17config_connectionEhb"));
+            auto send_brightness = reinterpret_cast<void (*)(void*)>(
+                    dlsym(lib_handle_.get(), "_ZN17oplus_light_iface15send_brightnessEv"));
+            if (p_iface != nullptr && *p_iface != nullptr && config_connection != nullptr) {
+                *reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(*p_iface) + 0x4e0) = 0;
+                config_connection(*p_iface, 1, true);
+                if (send_brightness != nullptr) {
+                    send_brightness(*p_iface);
+                }
+                LOG(INFO) << "Pinned oplus_light_iface QMI brightness channel active for ADSP";
+            }
+
             LOG(INFO) << "Added FusionLight sensor " << fusion_light_handle
                       << " backed by high-PWM RGB sensor " << high_pwm_handle;
         }
@@ -280,6 +339,12 @@ void SensorsSubHal::postEvents(const std::vector<Event>& events, ScopedWakelock 
                 continue;
             }
             output.push_back(std::move(flush_event));
+            continue;
+        }
+
+        // Suppress internal background events from raw_light_handle_ (wise_light), which is kept
+        // active for ADSP alsps_sip3625_lron QMI brightness sync.
+        if (event.sensorHandle == raw_light_handle_) {
             continue;
         }
 

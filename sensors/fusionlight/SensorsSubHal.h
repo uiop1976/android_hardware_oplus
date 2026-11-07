@@ -81,7 +81,10 @@ class SensorsSubHal : public ISensorsSubHal, public IHalProxyCallback {
     std::deque<FlushTarget> pending_flushes_;
     int32_t high_pwm_handle_ = -1;
     int32_t fusion_light_handle_ = -1;
+    int32_t raw_light_handle_ = -1;
     bool raw_enabled_ = false;
+    bool physical_high_pwm_active_ = false;
+    bool raw_light_activated_ = false;
     std::atomic_bool fusion_light_enabled_ = false;
 };
 
